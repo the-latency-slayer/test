@@ -3,7 +3,7 @@
 //########### Fix: ∀ app | applicationReferenceId ∈ keys(JSON) ∧ riskHumanTaskResponse.stepStatus = TRIGGERED:
 //###########   1) push applicationStateLogs {_id:'RiskHumanTask', status:'FINISHED', input, output = JSON value}
 //###########   2) set riskHumanTaskResponse = JSON value (stepStatus FINISHED) → journey moves ahead.
-//########### Is this tested locally and Pre/Post count of records & result verified : YES (mongo 4.0.28 local dry run)
+//########### Is this tested locally and Pre/Post count of records & result verified : YES (mongo 4.0.28: 10 eligible + 10 non-eligible, forced failures isolated)
 //
 //########### Single-application variant: only APP_REF (key in JSON) is processed.
 //########### Expected Number of records to get updated : 1
@@ -12,6 +12,7 @@
 //
 //########### Status : OPEN
 //
+//########### Per-app try/catch: failure of 1 app is logged under FAILED; remaining apps continue.
 //########### Legacy mongo shell 4.0.x compatible (ES5, cat(), no require/EJSON):
 //###########   mongo "<uri>" --eval "var APP_REF='MLP000000000000'; var JSON_PATH='/path/on/server/rem_human_task_responses.json'" addRiskHumanTaskResponseSingle.js
 //###########   (JSON_PATH optional; default below)
@@ -22,7 +23,6 @@ var t1 = Date.now();
 if (typeof JSON_PATH === 'undefined') var JSON_PATH = '/Users/vaibhav.bishnoi/maximus-scripts/Prod/2026/rem_human_task_responses.json';
 if (typeof APP_REF === 'undefined' || !APP_REF) throw new Error('APP_REF not set');
 var BACKUP_COLLECTION = 'riskHumanTaskResponse_backup_20260925_rem';
-var BATCH_SIZE = 100;
 
 db = db.getSiblingDB('orchestration');
 var personalCollection = db.getCollection('personal-applications');
@@ -46,12 +46,9 @@ function fromEjson(v) {
     return o;
 }
 
-function loadResponses(path) {
-    return fromEjson(JSON.parse(cat(path)));
-}
-
-var humanTaskResponses = loadResponses(JSON_PATH);
-if (!humanTaskResponses.hasOwnProperty(APP_REF)) throw new Error(APP_REF + ' not a key in ' + JSON_PATH);
+// raw EJSON kept; per-app conversion inside try → one bad value can't abort the run
+var rawResponses = JSON.parse(cat(JSON_PATH));
+if (!rawResponses.hasOwnProperty(APP_REF)) throw new Error(APP_REF + ' not a key in ' + JSON_PATH);
 var applicationReferenceIds = [APP_REF];
 
 function countByStatus(st) {
@@ -83,19 +80,14 @@ function buildStateLog(r, now) {
     };
 }
 
-var summary = { notFound: [], idMismatch: [], notTriggered: [], updated: [], matchedCount: 0 };
-var ops = [];
-var backups = [];
-
-function flush() {
-    if (ops.length === 0) return;
-    backupCollection.insertMany(backups, { ordered: false });
-    summary.matchedCount += personalCollection.bulkWrite(ops, { ordered: false }).matchedCount;
-    ops = [];
-    backups = [];
+function errMsg(e) {
+    if (e == null) return String(e);
+    return e.errmsg || e.message || tojsononeline(e);
 }
 
-print('Total responses in file: ' + Object.keys(humanTaskResponses).length + ', APP_REF: ' + APP_REF);
+var summary = { notFound: [], idMismatch: [], notTriggered: [], changedMeanwhile: [], failed: [], updated: [] };
+
+print('Total responses in file: ' + Object.keys(rawResponses).length + ', APP_REF: ' + APP_REF);
 print('JSON_PATH: ' + JSON_PATH);
 print('Pre count riskHumanTaskResponse TRIGGERED: ' + countByStatus('TRIGGERED') + ', FINISHED: ' + countByStatus('FINISHED'));
 
@@ -105,12 +97,14 @@ personalCollection.find(
     { _id: 1, applicationReferenceId: 1, riskHumanTaskResponse: 1 }
 ).forEach(function (a) { apps[a.applicationReferenceId] = a; });
 
-applicationReferenceIds.forEach(function (ref) {
-    var r = humanTaskResponses[ref];
+function processOne(ref) {
     var app = apps[ref];
-
     if (app == null) { summary.notFound.push(ref); return; }
+
+    var r = fromEjson(rawResponses[ref]);
+    if (!r || !r.applicationId || !r.decision || !r.tasks) throw new Error('invalid JSON value (applicationId/decision/tasks missing)');
     if (app._id.str !== r.applicationId) { summary.idMismatch.push(ref); return; }
+
     var existing = app.riskHumanTaskResponse;
     if (!existing || existing.stepStatus !== 'TRIGGERED') {
         summary.notTriggered.push(ref + ':' + (existing ? existing.stepStatus : 'MISSING'));
@@ -119,33 +113,50 @@ applicationReferenceIds.forEach(function (ref) {
 
     var now = Date.now();
     var log = buildStateLog(r, now);
-    backups.push({
+    var backupId = ObjectId();
+    backupCollection.insertOne({
+        _id: backupId,
         applicationReferenceId: ref,
         applicationId: app._id,
         oldRiskHumanTaskResponse: existing,
         pushedLogTimestamp: log.timestamp,
         backedUpAt: new Date(now)
     });
-    ops.push({
-        updateOne: {
-            filter: { _id: app._id, applicationReferenceId: ref, 'riskHumanTaskResponse.stepStatus': 'TRIGGERED' },
-            update: {
+    try {
+        var res = personalCollection.updateOne(
+            { _id: app._id, applicationReferenceId: ref, 'riskHumanTaskResponse.stepStatus': 'TRIGGERED' },
+            {
                 $set: { riskHumanTaskResponse: buildRiskHumanTaskResponse(r, existing) },
                 $push: { applicationStateLogs: log }
             }
-        }
-    });
+        );
+    } catch (e) {
+        backupCollection.deleteOne({ _id: backupId });
+        throw e;
+    }
+    if (res.matchedCount !== 1) {
+        backupCollection.deleteOne({ _id: backupId });
+        summary.changedMeanwhile.push(ref);
+        return;
+    }
     summary.updated.push(ref);
+}
 
-    if (ops.length >= BATCH_SIZE) flush();
+// ∀ ref: isolated try/catch → failure of one ≠ effect on others
+applicationReferenceIds.forEach(function (ref) {
+    try {
+        processOne(ref);
+    } catch (e) {
+        summary.failed.push(ref + ': ' + errMsg(e));
+    }
 });
-flush();
 
 print('Not found (' + summary.notFound.length + '): ' + tojsononeline(summary.notFound));
 print('applicationId mismatch (' + summary.idMismatch.length + '): ' + tojsononeline(summary.idMismatch));
 print('Not TRIGGERED, skipped (' + summary.notTriggered.length + '): ' + tojsononeline(summary.notTriggered));
+print('Status changed before write, skipped (' + summary.changedMeanwhile.length + '): ' + tojsononeline(summary.changedMeanwhile));
+print('FAILED, not updated (' + summary.failed.length + '): ' + tojsononeline(summary.failed));
 print('Updated (' + summary.updated.length + '): ' + tojsononeline(summary.updated));
-print('Result: matchedCount ' + summary.matchedCount); // 4.0 shell bulkWrite has no modifiedCount
 print('Post count riskHumanTaskResponse TRIGGERED: ' + countByStatus('TRIGGERED') + ', FINISHED: ' + countByStatus('FINISHED'));
 
 var t2 = Date.now();
