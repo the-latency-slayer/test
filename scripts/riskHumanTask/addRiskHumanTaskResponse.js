@@ -1,23 +1,26 @@
 //############ Description:
 //############ RCA is still pending
-//########### Fix: set riskHumanTaskResponse (from JSON) as FINISHED + push RiskHumanTask TRIGGERED & FINISHED state logs → journey moves ahead.
+//########### Fix: ∀ app | applicationReferenceId ∈ keys(JSON) ∧ riskHumanTaskResponse.stepStatus = TRIGGERED:
+//###########   1) push applicationStateLogs {_id:'RiskHumanTask', status:'FINISHED', input, output = JSON value}
+//###########   2) set riskHumanTaskResponse = JSON value (stepStatus FINISHED) → journey moves ahead.
 //########### Is this tested locally and Pre/Post count of records & result verified : YES (mongo 4.0.28 local dry run)
 //
-//########### Expected Number of records to get updated : 535 (max; apps with riskHumanTaskResponse already FINISHED are skipped)
+//########### Expected Number of records to get updated : ≤ keys in JSON (only riskHumanTaskResponse.stepStatus = TRIGGERED)
 //
 //########### is permanent fixed planned : NA
 //
 //########### Status : OPEN
 //
 //########### Legacy mongo shell 4.0.x compatible (ES5, cat(), no require/EJSON):
-//###########   mongo "<uri>" addRiskHumanTaskResponse.js
+//###########   mongo "<uri>" --eval "var JSON_PATH='/path/on/server/rem_human_task_responses.json'" addRiskHumanTaskResponse.js
+//###########   (JSON_PATH optional; default below)
 //###########   set DRY_RUN = true to only print the plan, no writes.
 //
 // ################################################ Actual Script Start ####################################################################
 var t1 = Date.now();
 
 var DRY_RUN = false;
-var JSON_PATH = '/Users/vaibhav.bishnoi/maximus-scripts/Prod/2026/rem_human_task_responses.json';
+if (typeof JSON_PATH === 'undefined') var JSON_PATH = '/Users/vaibhav.bishnoi/maximus-scripts/Prod/2026/rem_human_task_responses.json';
 var BACKUP_COLLECTION = 'riskHumanTaskResponse_backup_20260925_rem';
 var BATCH_SIZE = 100;
 
@@ -50,10 +53,10 @@ function loadResponses(path) {
 var humanTaskResponses = loadResponses(JSON_PATH);
 var applicationReferenceIds = Object.keys(humanTaskResponses);
 
-function countFinished() {
+function countByStatus(st) {
     return personalCollection.find({
         applicationReferenceId: { $in: applicationReferenceIds },
-        'riskHumanTaskResponse.stepStatus': 'FINISHED'
+        'riskHumanTaskResponse.stepStatus': st
     }).count();
 }
 
@@ -68,26 +71,18 @@ function buildRiskHumanTaskResponse(r, existing) {
     };
 }
 
-function buildStateLogs(r, now) {
-    return [
-        {
-            _id: 'RiskHumanTask',
-            status: 'TRIGGERED',
-            stepExecutionTimeInMillis: '2',
-            timestamp: new Date(now).toISOString()
-        },
-        {
-            _id: 'RiskHumanTask',
-            status: 'FINISHED',
-            input: { applicationId: r.applicationId, decision: r.decision, tasks: r.tasks },
-            output: { applicationId: r.applicationId, decision: r.decision, tasks: r.tasks, _class: 'HumanTaskResponse' },
-            stepExecutionTimeInMillis: '11',
-            timestamp: new Date(now + 1).toISOString()
-        }
-    ];
+function buildStateLog(r, now) {
+    return {
+        _id: 'RiskHumanTask',
+        status: 'FINISHED',
+        input: { applicationId: r.applicationId, decision: r.decision, tasks: r.tasks },
+        output: { applicationId: r.applicationId, decision: r.decision, tasks: r.tasks, _class: 'HumanTaskResponse' },
+        stepExecutionTimeInMillis: '11',
+        timestamp: new Date(now).toISOString()
+    };
 }
 
-var summary = { notFound: [], idMismatch: [], alreadyFinished: [], hadRiskHumanTaskLog: [], updated: [], matchedCount: 0 };
+var summary = { notFound: [], idMismatch: [], notTriggered: [], updated: [], matchedCount: 0 };
 var ops = [];
 var backups = [];
 var sampleOp = null;
@@ -105,12 +100,13 @@ function flush() {
 
 print('DRY_RUN: ' + DRY_RUN);
 print('Total responses in file: ' + applicationReferenceIds.length);
-print('Pre count riskHumanTaskResponse FINISHED: ' + countFinished());
+print('JSON_PATH: ' + JSON_PATH);
+print('Pre count riskHumanTaskResponse TRIGGERED: ' + countByStatus('TRIGGERED') + ', FINISHED: ' + countByStatus('FINISHED'));
 
 var apps = {};
 personalCollection.find(
     { applicationReferenceId: { $in: applicationReferenceIds } },
-    { _id: 1, applicationReferenceId: 1, riskHumanTaskResponse: 1, 'applicationStateLogs._id': 1 }
+    { _id: 1, applicationReferenceId: 1, riskHumanTaskResponse: 1 }
 ).forEach(function (a) { apps[a.applicationReferenceId] = a; });
 
 applicationReferenceIds.forEach(function (ref) {
@@ -120,24 +116,26 @@ applicationReferenceIds.forEach(function (ref) {
     if (app == null) { summary.notFound.push(ref); return; }
     if (app._id.str !== r.applicationId) { summary.idMismatch.push(ref); return; }
     var existing = app.riskHumanTaskResponse;
-    if (existing && existing.stepStatus === 'FINISHED') { summary.alreadyFinished.push(ref); return; }
-    if ((app.applicationStateLogs || []).some(function (l) { return l._id === 'RiskHumanTask'; })) summary.hadRiskHumanTaskLog.push(ref);
+    if (!existing || existing.stepStatus !== 'TRIGGERED') {
+        summary.notTriggered.push(ref + ':' + (existing ? existing.stepStatus : 'MISSING'));
+        return;
+    }
 
     var now = Date.now();
-    var logs = buildStateLogs(r, now);
+    var log = buildStateLog(r, now);
     backups.push({
         applicationReferenceId: ref,
         applicationId: app._id,
-        oldRiskHumanTaskResponse: existing === undefined ? null : existing,
-        pushedLogTimestamps: logs.map(function (l) { return l.timestamp; }),
+        oldRiskHumanTaskResponse: existing,
+        pushedLogTimestamp: log.timestamp,
         backedUpAt: new Date(now)
     });
     ops.push({
         updateOne: {
-            filter: { _id: app._id, applicationReferenceId: ref, 'riskHumanTaskResponse.stepStatus': { $ne: 'FINISHED' } },
+            filter: { _id: app._id, applicationReferenceId: ref, 'riskHumanTaskResponse.stepStatus': 'TRIGGERED' },
             update: {
                 $set: { riskHumanTaskResponse: buildRiskHumanTaskResponse(r, existing) },
-                $push: { applicationStateLogs: { $each: logs } }
+                $push: { applicationStateLogs: log }
             }
         }
     });
@@ -151,16 +149,15 @@ flush();
 if (DRY_RUN && sampleOp !== null) print('Sample update: ' + tojson(sampleOp));
 print('Not found (' + summary.notFound.length + '): ' + tojsononeline(summary.notFound));
 print('applicationId mismatch (' + summary.idMismatch.length + '): ' + tojsononeline(summary.idMismatch));
-print('Already FINISHED, skipped (' + summary.alreadyFinished.length + '): ' + tojsononeline(summary.alreadyFinished));
-print('Had RiskHumanTask log before (' + summary.hadRiskHumanTaskLog.length + '): ' + tojsononeline(summary.hadRiskHumanTaskLog));
+print('Not TRIGGERED, skipped (' + summary.notTriggered.length + '): ' + tojsononeline(summary.notTriggered));
 print((DRY_RUN ? 'Would update (' : 'Updated (') + summary.updated.length + '): ' + tojsononeline(summary.updated));
 print('Result: matchedCount ' + summary.matchedCount); // 4.0 shell bulkWrite has no modifiedCount
-print('Post count riskHumanTaskResponse FINISHED: ' + countFinished());
+print('Post count riskHumanTaskResponse TRIGGERED: ' + countByStatus('TRIGGERED') + ', FINISHED: ' + countByStatus('FINISHED'));
 
 var t2 = Date.now();
 print('Time took in milliseconds --> ' + (t2 - t1));
 
 // Rollback per backup doc b:
 //   $set riskHumanTaskResponse = b.oldRiskHumanTaskResponse (or $unset if null)
-//   $pull applicationStateLogs { _id: 'RiskHumanTask', timestamp: { $in: b.pushedLogTimestamps } }
+//   $pull applicationStateLogs { _id: 'RiskHumanTask', status: 'FINISHED', timestamp: b.pushedLogTimestamp }
 // ################################################ Actual Script End  #####################################################################
