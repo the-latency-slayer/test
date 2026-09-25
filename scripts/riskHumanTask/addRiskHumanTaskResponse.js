@@ -14,12 +14,10 @@
 //########### Legacy mongo shell 4.0.x compatible (ES5, cat(), no require/EJSON):
 //###########   mongo "<uri>" --eval "var JSON_PATH='/path/on/server/rem_human_task_responses.json'" addRiskHumanTaskResponse.js
 //###########   (JSON_PATH optional; default below)
-//###########   set DRY_RUN = true to only print the plan, no writes.
 //
 // ################################################ Actual Script Start ####################################################################
 var t1 = Date.now();
 
-var DRY_RUN = false;
 if (typeof JSON_PATH === 'undefined') var JSON_PATH = '/Users/vaibhav.bishnoi/maximus-scripts/Prod/2026/rem_human_task_responses.json';
 var BACKUP_COLLECTION = 'riskHumanTaskResponse_backup_20260925_rem';
 var BATCH_SIZE = 100;
@@ -85,20 +83,15 @@ function buildStateLog(r, now) {
 var summary = { notFound: [], idMismatch: [], notTriggered: [], updated: [], matchedCount: 0 };
 var ops = [];
 var backups = [];
-var sampleOp = null;
 
 function flush() {
     if (ops.length === 0) return;
-    if (!DRY_RUN) {
-        backupCollection.insertMany(backups, { ordered: false });
-        var res = personalCollection.bulkWrite(ops, { ordered: false });
-        summary.matchedCount += res.matchedCount;
-    }
+    backupCollection.insertMany(backups, { ordered: false });
+    summary.matchedCount += personalCollection.bulkWrite(ops, { ordered: false }).matchedCount;
     ops = [];
     backups = [];
 }
 
-print('DRY_RUN: ' + DRY_RUN);
 print('Total responses in file: ' + applicationReferenceIds.length);
 print('JSON_PATH: ' + JSON_PATH);
 print('Pre count riskHumanTaskResponse TRIGGERED: ' + countByStatus('TRIGGERED') + ', FINISHED: ' + countByStatus('FINISHED'));
@@ -139,18 +132,16 @@ applicationReferenceIds.forEach(function (ref) {
             }
         }
     });
-    if (sampleOp === null) sampleOp = ops[ops.length - 1];
     summary.updated.push(ref);
 
     if (ops.length >= BATCH_SIZE) flush();
 });
 flush();
 
-if (DRY_RUN && sampleOp !== null) print('Sample update: ' + tojson(sampleOp));
 print('Not found (' + summary.notFound.length + '): ' + tojsononeline(summary.notFound));
 print('applicationId mismatch (' + summary.idMismatch.length + '): ' + tojsononeline(summary.idMismatch));
 print('Not TRIGGERED, skipped (' + summary.notTriggered.length + '): ' + tojsononeline(summary.notTriggered));
-print((DRY_RUN ? 'Would update (' : 'Updated (') + summary.updated.length + '): ' + tojsononeline(summary.updated));
+print('Updated (' + summary.updated.length + '): ' + tojsononeline(summary.updated));
 print('Result: matchedCount ' + summary.matchedCount); // 4.0 shell bulkWrite has no modifiedCount
 print('Post count riskHumanTaskResponse TRIGGERED: ' + countByStatus('TRIGGERED') + ', FINISHED: ' + countByStatus('FINISHED'));
 
