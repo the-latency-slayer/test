@@ -6,9 +6,10 @@
 //   node fetchRiskHumanTaskResponses.js refs.txt [outDir]
 //   refs.txt: any text; every MLP\d{12} in it is used (one per line, JSON, logs … all fine)
 // Transport (one of):
-//   ES_URL=https://es-host:9200  ES_AUTH="Basic <b64>" | "ApiKey <key>"
-//   KIBANA_URL=https://kibana-host  KIBANA_AUTH="Basic <b64>"  or  KIBANA_COOKIE="sid=..."   (Dev Tools console proxy)
-// Optional: FROM=now-3d  TO=now  INDEX=personal-loan-prod-*  BATCH=150  CONCURRENCY=3
+//   ES_URL=https://es-host:9200  ES_USER/ES_PASS | ES_AUTH="Basic <b64>" | "ApiKey <key>"
+//   KIBANA_URL=https://kibana-host  KIBANA_USER/KIBANA_PASS | KIBANA_AUTH | KIBANA_COOKIE="sid=..."   (Dev Tools console proxy)
+// Optional: FROM=now-3d (or ISO e.g. 2026-09-24T19:00:00+05:30)  TO=now  INDEX=personal-loan-prod-*  BATCH=150  CONCURRENCY=3
+// Only decision ≠ APPROVED (latest event per ref) is written; every ref isolated (one error ≠ stop).
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -34,13 +35,16 @@ const INT32 = 2 ** 31;
 // ---------------------------------------------------------------- transport
 async function search(body) {
   let url, headers = { 'Content-Type': 'application/json' };
+  const basic = (u, p) => 'Basic ' + Buffer.from(u + ':' + p).toString('base64');
   if (E.ES_URL) {
     url = E.ES_URL.replace(/\/$/, '') + '/' + INDEX + '/_search';
     if (E.ES_AUTH) headers.Authorization = E.ES_AUTH;
+    else if (E.ES_USER) headers.Authorization = basic(E.ES_USER, E.ES_PASS || '');
   } else if (E.KIBANA_URL) {
     url = E.KIBANA_URL.replace(/\/$/, '') + '/api/console/proxy?path=' + encodeURIComponent(INDEX + '/_search') + '&method=POST';
     headers['kbn-xsrf'] = 'true';
     if (E.KIBANA_AUTH) headers.Authorization = E.KIBANA_AUTH;
+    else if (E.KIBANA_USER) headers.Authorization = basic(E.KIBANA_USER, E.KIBANA_PASS || '');
     if (E.KIBANA_COOKIE) headers.Cookie = E.KIBANA_COOKIE;
   } else throw new Error('set ES_URL or KIBANA_URL');
   for (let i = 0; ; i++) {
